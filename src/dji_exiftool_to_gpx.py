@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
-"""Convert GPS samples from a DJI ExifTool -ee text dump into a GPX 1.1 track.
+"""Convert DJI ExifTool -ee text output into a GPX track and exposure graph.
 
 Usage:
     python3 dji_exiftool_to_gpx.py DJI_video.txt
-    python3 dji_exiftool_to_gpx.py DJI_video.txt -o flight.gpx
+    python3 dji_exiftool_to_gpx.py DJI_video.txt -o flight.gpx --plot-output exposure.png
+    python3 dji_exiftool_to_gpx.py DJI_video.txt --no-plot
 
-Only reads the text dump; never opens the original video or invokes ExifTool.
+Input is *only* the text file produced by 'exiftool -ee VIDEO.MP4'.
+The script never reads the MP4 file or invokes ExifTool.
+
+Requires matplotlib for the exposure graph:
+    python3 -m pip install matplotlib
 """
 
 import argparse
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from fractions import Fraction
 import math
 from pathlib import Path
 import re
@@ -31,23 +37,26 @@ DMS_RE = re.compile(
     r'(\d+(?:\.\d+)?)\s*["\u2033]?\s*([NSEW])\s*$',
     re.IGNORECASE,
 )
-
 DATE_PREFIX_RE = re.compile(r"^(\d{4}):(\d{2}):(\d{2})\s+")
 
 REQUIRED_FIELDS = ("GPS Latitude", "GPS Longitude", "GPS Date/Time")
-GPS_FIELDS = set(REQUIRED_FIELDS) | {"Absolute Altitude"}
+EXPOSURE_FIELDS = ("ISO", "Shutter Speed", "F Number")
+SAMPLE_FIELDS = set(REQUIRED_FIELDS) | {"Absolute Altitude"} | set(EXPOSURE_FIELDS)
 
 
 @dataclass(frozen=True)
 class TrackPoint:
     latitude: float
     longitude: float
-    timestamp: str  # ISO 8601, UTC
+    timestamp: str  # ISO 8601 UTC, preserving fraction of a second
     altitude_m: float | None = None
+    iso: float | None = None
+    shutter_seconds: float | None = None
+    f_number: float | None = None
 
 
 def parse_coordinate(raw: str, *, latitude: bool) -> float:
-    """Parse ExifTool's DMS coordinates, or signed decimal degrees."""
+    """Parse ExifTool DMS coordinates or signed decimal degrees."""
     raw = raw.strip()
     match = DMS_RE.fullmatch(raw)
 
@@ -62,7 +71,6 @@ def parse_coordinate(raw: str, *, latitude: bool) -> float:
         if hemisphere in ("S", "W"):
             value = -value
     else:
-        # Also accept decimal degrees such as -111.245875 or 32.60657 N.
         decimal = re.fullmatch(r"([+-]?\d+(?:\.\d+)?)\s*([NSEW])?", raw, re.I)
         if not decimal:
             raise ValueError(f"unrecognized GPS coordinate: {raw!r}")
@@ -84,8 +92,6 @@ def parse_coordinate(raw: str, *, latitude: bool) -> float:
 
 def parse_timestamp(raw: str) -> str:
     """Convert ExifTool GPS Date/Time to an ISO-8601 UTC timestamp for GPX."""
-    # ExifTool: 2026:05:09 17:57:47.033Z
-    # ISO 8601: 2026-05-09T17:57:47.033Z
     iso = DATE_PREFIX_RE.sub(r"\1-\2-\3T", raw.strip(), count=1)
     iso = iso.replace("Z", "+00:00")
     try:
@@ -93,7 +99,7 @@ def parse_timestamp(raw: str) -> str:
     except ValueError as exc:
         raise ValueError(f"invalid GPS Date/Time: {raw!r}") from exc
 
-    # GPS Date/Time is defined as UTC; only apply this default when no zone is given.
+    # ExifTool's GPS Date/Time is normally UTC; default to UTC if unspecified.
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     dt = dt.astimezone(timezone.utc)
@@ -106,6 +112,30 @@ def parse_timestamp(raw: str) -> str:
     else:
         timespec = "seconds"
     return dt.isoformat(timespec=timespec).replace("+00:00", "Z")
+
+
+def parse_positive_number(raw: str | None) -> float | None:
+    """Return finite positive telemetry values, or None if absent/bad."""
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    return value if math.isfinite(value) and value > 0 else None
+
+
+def parse_shutter_seconds(raw: str | None) -> float | None:
+    """Parse ExifTool shutter speeds such as '1/100', '1/131', or '0.01'."""
+    if raw is None:
+        return None
+    # Fractions avoid any dependence on locale and support numeric strings too.
+    raw = re.sub(r"\s*(?:s|sec|seconds)$", "", raw.strip(), flags=re.I)
+    try:
+        value = float(Fraction(raw))
+    except (ValueError, ZeroDivisionError, OverflowError):
+        return None
+    return value if math.isfinite(value) and value > 0 else None
 
 
 def parse_sample(sample: dict[str, str]) -> TrackPoint:
@@ -123,15 +153,24 @@ def parse_sample(sample: dict[str, str]) -> TrackPoint:
         if not math.isfinite(altitude):
             raise ValueError("non-finite Absolute Altitude")
 
-    return TrackPoint(lat, lon, timestamp, altitude)
+    # Missing or malformed exposure data does NOT invalidate a GPS sample.
+    # The graph uses NaN for missing readings and retains every timestamp.
+    return TrackPoint(
+        latitude=lat,
+        longitude=lon,
+        timestamp=timestamp,
+        altitude_m=altitude,
+        iso=parse_positive_number(sample.get("ISO")),
+        shutter_seconds=parse_shutter_seconds(sample.get("Shutter Speed")),
+        f_number=parse_positive_number(sample.get("F Number")),
+    )
 
 
 def read_samples(path: Path) -> tuple[list[TrackPoint], int, list[str]]:
-    """Group lines by Sample Time, avoiding fields from other MP4 tracks.
+    """Group repeated DJI telemetry records by Sample Time, in file order.
 
-    Sample Time begins each repeated DJI telemetry record; GPS Date/Time
-    is near its end. The Sample Time value itself may be rounded by ExifTool,
-    so we use GPS Date/Time for the actual GPX timestamp.
+    Each Sample Time starts a new record. Its displayed value may be rounded,
+    so never use that number as the graph or GPX timestamp; use GPS Date/Time.
     """
     points: list[TrackPoint] = []
     total_samples = 0
@@ -161,11 +200,10 @@ def read_samples(path: Path) -> tuple[list[TrackPoint], int, list[str]]:
                 current = {}
                 start_line = line_number
             elif key == "Track Header Version" and current is not None:
-                # Previous telemetry track ended; remaining tags may belong
-                # to unrelated MP4 tracks (e.g. DJI dbgi metadata).
+                # A subsequent MP4 metadata track is not a DJI telemetry sample.
                 finish_sample()
                 current = None
-            elif current is not None and key in GPS_FIELDS:
+            elif current is not None and key in SAMPLE_FIELDS:
                 current[key] = value
 
     finish_sample()
@@ -203,24 +241,100 @@ def make_gpx(points: list[TrackPoint], track_name: str) -> ET.ElementTree:
     return ET.ElementTree(root)
 
 
+def make_exposure_plot(points: list[TrackPoint], track_name: str, output: Path) -> None:
+    """Draw all GPS-aligned exposure samples on three shared-time axes.
+
+    Every data series has exactly len(points) entries. A missing exposure
+    value is represented by NaN, so it never shifts later values in time.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")  # Works on headless Ubuntu servers.
+    import matplotlib.dates as mdates
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import FuncFormatter
+
+    # Use true per-sample UTC timestamps, not rounded Sample Time strings.
+    times = [datetime.fromisoformat(p.timestamp.replace("Z", "+00:00")) for p in points]
+    iso = [p.iso if p.iso is not None else math.nan for p in points]
+    shutter_seconds = [
+        p.shutter_seconds if p.shutter_seconds is not None else math.nan
+        for p in points
+    ]
+    f_number = [p.f_number if p.f_number is not None else math.nan for p in points]
+
+    fig, axes = plt.subplots(3, 1, figsize=(14, 9), sharex=True, constrained_layout=True)
+    fig.suptitle(
+        f"DJI exposure triangle — {track_name}\n"
+        f"{times[0]:%Y-%m-%d} UTC  |  {len(points):,} timestamped samples",
+        fontsize=15,
+    )
+
+    # Use distinct colors to make each exposure-triangle parameter easy to identify.
+    for ax, values, color in zip(
+        axes,
+        (iso, shutter_seconds, f_number),
+        ("tab:blue", "tab:orange", "tab:green"),
+    ):
+        # A marker is plotted for each reading; the connecting line shows trends.
+        ax.plot(times, values, color=color, linewidth=0.8, marker=".", markersize=1.6)
+        ax.grid(True, alpha=0.3)
+        ax.margins(x=0.01)
+
+    axes[0].set_ylabel("ISO")
+    axes[0].set_title("Sensor sensitivity (ISO)", loc="left", fontsize=11)
+
+    # Plot exposure duration directly in seconds, with decimal tick labels.
+    # Four decimal places are enough to display shutter times near 1/100 s.
+    def shutter_tick(seconds: float, _: int) -> str:
+        return f"{seconds:.4f}".rstrip("0").rstrip(".")
+
+    axes[1].set_ylabel("Exposure time (s)")
+    axes[1].set_title("Exposure time (shutter speed)", loc="left", fontsize=11)
+    axes[1].yaxis.set_major_formatter(FuncFormatter(shutter_tick))
+
+    axes[2].set_ylabel("Aperture")
+    axes[2].set_title("Lens aperture (f-number)", loc="left", fontsize=11)
+    axes[2].yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:g}"))
+    axes[2].set_xlabel("GPS Date/Time (UTC, HH:MM:SS)")
+    axes[2].xaxis.set_major_locator(mdates.AutoDateLocator(tz=timezone.utc))
+    axes[2].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S", tz=timezone.utc))
+
+    fig.savefig(output, dpi=160, facecolor="white")
+    plt.close(fig)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Convert the text output of 'exiftool -ee VIDEO.MP4' to a GPX track."
+        description=("Convert 'exiftool -ee VIDEO.MP4' text output into a GPX track "
+                     "and a timestamp-aligned exposure-triangle PNG graph.")
     )
-    parser.add_argument("-i", "--input", required=True, type=Path, help="ExifTool plain-text output (.txt)")
-    parser.add_argument("-o", "--output", type=Path, help="GPX output path (default: input name with .gpx)")
-    parser.add_argument("--overwrite", action="store_true", help="Permit replacing an existing output GPX")
+    parser.add_argument("input", type=Path, help="ExifTool plain-text output (.txt)")
+    parser.add_argument("-o", "--output", type=Path,
+                        help="GPX output path (default: input name with .gpx)")
+    parser.add_argument("--plot-output", type=Path,
+                        help="PNG output path (default: INPUT_exposure.png)")
+    parser.add_argument("--no-plot", action="store_true", help="Generate only the GPX")
+    parser.add_argument("--overwrite", action="store_true",
+                        help="Permit replacing existing GPX and PNG outputs")
     args = parser.parse_args()
 
     input_path = args.input
-    output_path = args.output or input_path.with_suffix(".gpx")
+    gpx_path = args.output or input_path.with_suffix(".gpx")
+    plot_path = args.plot_output or input_path.with_name(input_path.stem + "_exposure.png")
 
     if not input_path.is_file():
         parser.error(f"input file does not exist: {input_path}")
-    if input_path.resolve() == output_path.resolve():
-        parser.error("input and output must be different paths")
-    if output_path.exists() and not args.overwrite:
-        parser.error(f"output already exists: {output_path} (use --overwrite to replace it)")
+    paths = [gpx_path] if args.no_plot else [gpx_path, plot_path]
+    if any(path.resolve() == input_path.resolve() for path in paths):
+        parser.error("input and output paths must be different")
+    if not args.no_plot and gpx_path.resolve() == plot_path.resolve():
+        parser.error("GPX and PNG output paths must be different")
+    for path in paths:
+        if path.exists() and not args.overwrite:
+            parser.error(f"output already exists: {path} (use --overwrite to replace it)")
+        if not path.parent.is_dir():
+            parser.error(f"output directory does not exist: {path.parent}")
 
     try:
         points, total, problems = read_samples(input_path)
@@ -233,24 +347,39 @@ def main() -> int:
         for problem in problems[:5]:
             print(f"[WARNING] Skipped {problem}", file=sys.stderr)
         if len(problems) > 5:
-            print(f"[WARNING] ... and {len(problems) - 5} additional invalid samples.", file=sys.stderr)
+            print(f"[WARNING] ... and {len(problems) - 5} additional invalid samples.",
+                  file=sys.stderr)
 
-        # Keep ExifTool's sample order. A GPX track is an ordered sequence,
-        # and repeated coordinates with distinct timestamps are intentional.
-        tree = make_gpx(points, input_path.stem)
-        tree.write(output_path, encoding="utf-8", xml_declaration=True)
+        # Preserve ExifTool's original sample ordering; do not thin or dedupe.
+        make_gpx(points, input_path.stem).write(
+            gpx_path, encoding="utf-8", xml_declaration=True
+        )
 
-    except (OSError, UnicodeError) as exc:
+        if not args.no_plot:
+            try:
+                make_exposure_plot(points, input_path.stem, plot_path)
+            except ImportError:
+                print("[ERROR] Plotting requires matplotlib: "
+                      "python3 -m pip install matplotlib", file=sys.stderr)
+                return 1
+
+    except (OSError, UnicodeError, ValueError) as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
         return 1
 
-    print(f"Input:        {input_path}")
-    print(f"Output:       {output_path.resolve()}")
-    print(f"Samples read: {total}")
-    print(f"Track points: {len(points)}")
-    print(f"Skipped:      {total - len(points)}")
-    print(f"First UTC:    {points[0].timestamp}")
-    print(f"Last UTC:     {points[-1].timestamp}")
+    print(f"Input:         {input_path}")
+    print(f"GPX output:    {gpx_path.resolve()}")
+    if not args.no_plot:
+        print(f"Plot output:   {plot_path.resolve()}")
+    print(f"Samples read:  {total}")
+    print(f"GPX points:    {len(points)}")
+    print(f"Skipped:       {total - len(points)}")
+    print(f"First UTC:     {points[0].timestamp}")
+    print(f"Last UTC:      {points[-1].timestamp}")
+    if not args.no_plot:
+        for label, attr in (("ISO", "iso"), ("Shutter", "shutter_seconds"), ("F-number", "f_number")):
+            available = sum(getattr(point, attr) is not None for point in points)
+            print(f"{label + ' points:':<15}{available} / {len(points)}")
     return 0
 
 
