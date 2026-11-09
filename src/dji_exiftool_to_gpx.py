@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""Convert DJI ExifTool -ee text output into a GPX track and exposure graph.
+"""Convert DJI ExifTool -ee text output into a GPX track and time-series plots.
 
 Usage:
     python3 dji_exiftool_to_gpx.py DJI_video.txt
     python3 dji_exiftool_to_gpx.py DJI_video.txt -o flight.gpx --plot-output exposure.png
+    python3 dji_exiftool_to_gpx.py DJI_video.txt --attitude-output attitude.png
+    python3 dji_exiftool_to_gpx.py DJI_video.txt --unwrap-yaw
     python3 dji_exiftool_to_gpx.py DJI_video.txt --no-plot
 
 Input is *only* the text file produced by 'exiftool -ee VIDEO.MP4'.
 The script never reads the MP4 file or invokes ExifTool.
 
-Requires matplotlib for the exposure graph:
+Requires matplotlib for the exposure and attitude graphs:
     python3 -m pip install matplotlib
 """
 
@@ -41,7 +43,9 @@ DATE_PREFIX_RE = re.compile(r"^(\d{4}):(\d{2}):(\d{2})\s+")
 
 REQUIRED_FIELDS = ("GPS Latitude", "GPS Longitude", "GPS Date/Time")
 EXPOSURE_FIELDS = ("ISO", "Shutter Speed", "F Number")
-SAMPLE_FIELDS = set(REQUIRED_FIELDS) | {"Absolute Altitude"} | set(EXPOSURE_FIELDS)
+ATTITUDE_FIELDS = ("Drone Roll", "Drone Pitch", "Drone Yaw")
+SAMPLE_FIELDS = (set(REQUIRED_FIELDS) | {"Absolute Altitude"}
+                 | set(EXPOSURE_FIELDS) | set(ATTITUDE_FIELDS))
 
 
 @dataclass(frozen=True)
@@ -53,6 +57,9 @@ class TrackPoint:
     iso: float | None = None
     shutter_seconds: float | None = None
     f_number: float | None = None
+    roll_deg: float | None = None
+    pitch_deg: float | None = None
+    yaw_deg: float | None = None
 
 
 def parse_coordinate(raw: str, *, latitude: bool) -> float:
@@ -125,6 +132,17 @@ def parse_positive_number(raw: str | None) -> float | None:
     return value if math.isfinite(value) and value > 0 else None
 
 
+def parse_signed_angle(raw: str | None) -> float | None:
+    """Parse a signed angle in degrees; zero and negative values are valid."""
+    if raw is None:
+        return None
+    try:
+        value = float(raw.strip().removesuffix("°").strip())
+    except ValueError:
+        return None
+    return value if math.isfinite(value) else None
+
+
 def parse_shutter_seconds(raw: str | None) -> float | None:
     """Parse ExifTool shutter speeds such as '1/100', '1/131', or '0.01'."""
     if raw is None:
@@ -163,6 +181,9 @@ def parse_sample(sample: dict[str, str]) -> TrackPoint:
         iso=parse_positive_number(sample.get("ISO")),
         shutter_seconds=parse_shutter_seconds(sample.get("Shutter Speed")),
         f_number=parse_positive_number(sample.get("F Number")),
+        roll_deg=parse_signed_angle(sample.get("Drone Roll")),
+        pitch_deg=parse_signed_angle(sample.get("Drone Pitch")),
+        yaw_deg=parse_signed_angle(sample.get("Drone Yaw")),
     )
 
 
@@ -304,32 +325,149 @@ def make_exposure_plot(points: list[TrackPoint], track_name: str, output: Path) 
     plt.close(fig)
 
 
+
+def unwrap_yaw_degrees(values: list[float]) -> list[float]:
+    """Unwrap successive DJI yaw angles across +/-180 degrees.
+
+    Missing readings stay as NaN; unwrapping uses the previous valid sample.
+    This is a display-only transformation; the input telemetry is unmodified.
+    """
+    output: list[float] = []
+    previous_raw: float | None = None
+    previous_continuous: float | None = None
+    for value in values:
+        if not math.isfinite(value):
+            output.append(math.nan)
+            continue
+        if previous_raw is None or previous_continuous is None:
+            continuous = value
+        else:
+            # Find the shortest signed angular difference modulo 360 degrees.
+            delta = (value - previous_raw + 180.0) % 360.0 - 180.0
+            continuous = previous_continuous + delta
+        output.append(continuous)
+        previous_raw = value
+        previous_continuous = continuous
+    return output
+
+
+def make_attitude_plot(
+    points: list[TrackPoint], track_name: str, output: Path, *, unwrap_yaw: bool = False
+) -> None:
+    """Draw native DJI roll/pitch/yaw in degrees, sharing GPS time on x-axis.
+
+    Every series has one slot per GPS trackpoint. Missing angles create gaps;
+    no samples are invented. Raw yaw is split at +/-180-degree wraparound so
+    the line does not falsely imply an abrupt 360-degree rotation.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")  # Safe to run without a graphical desktop.
+    import matplotlib.dates as mdates
+    import matplotlib.pyplot as plt
+
+    times = [datetime.fromisoformat(p.timestamp.replace("Z", "+00:00")) for p in points]
+    roll = [p.roll_deg if p.roll_deg is not None else math.nan for p in points]
+    pitch = [p.pitch_deg if p.pitch_deg is not None else math.nan for p in points]
+    yaw_raw = [p.yaw_deg if p.yaw_deg is not None else math.nan for p in points]
+    yaw = unwrap_yaw_degrees(yaw_raw) if unwrap_yaw else yaw_raw
+
+    fig, axes = plt.subplots(3, 1, figsize=(14, 9), sharex=True, constrained_layout=True)
+    fig.suptitle(
+        f"DJI drone attitude — {track_name}\n"
+        f"{times[0]:%Y-%m-%d} UTC  |  {len(points):,} GPS-timestamped samples",
+        fontsize=15,
+    )
+
+    for ax, values, label, color in zip(
+        axes,
+        (roll, pitch, yaw),
+        ("Roll (°)", "Pitch (°)", "Yaw (°)"),
+        ("tab:blue", "tab:orange", "tab:green"),
+    ):
+        ax.set_ylabel(label)
+        ax.set_title(label.replace(" (°)", " angle"), loc="left", fontsize=11)
+        ax.axhline(0, linewidth=0.75, color="gray", alpha=0.6)
+        ax.grid(True, alpha=0.3)
+        ax.margins(x=0.01)
+        if ax is not axes[2] or unwrap_yaw:
+            ax.plot(times, values, color=color, linewidth=0.9,
+                    marker=".", markersize=1.8)
+
+    if not unwrap_yaw:
+        # Preserve all raw yaw samples. The markers remain visible on both
+        # sides of wrap boundaries; separate line segments avoid a false jump.
+        ax = axes[2]
+        ax.plot(times, yaw, linestyle="None", color="tab:green",
+                marker=".", markersize=1.8)
+        xs, ys = [], []
+        for timestamp, angle in zip(times, yaw):
+            if not math.isfinite(angle) or (ys and abs(angle - ys[-1]) > 180):
+                if xs:
+                    ax.plot(xs, ys, color="tab:green", linewidth=0.9)
+                xs, ys = [], []
+            if math.isfinite(angle):
+                xs.append(timestamp)
+                ys.append(angle)
+        if xs:
+            ax.plot(xs, ys, color="tab:green", linewidth=0.9)
+
+    axes[2].set_title(
+        "Yaw angle (continuous/unwrapped)" if unwrap_yaw else "Yaw angle (native DJI, ±180° wrap)",
+        loc="left", fontsize=11,
+    )
+    axes[2].set_xlabel("GPS Date/Time (UTC, HH:MM:SS)")
+    axes[2].xaxis.set_major_locator(mdates.AutoDateLocator(tz=timezone.utc))
+    axes[2].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S", tz=timezone.utc))
+
+    fig.savefig(output, dpi=160, facecolor="white")
+    plt.close(fig)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=("Convert 'exiftool -ee VIDEO.MP4' text output into a GPX track "
-                     "and a timestamp-aligned exposure-triangle PNG graph.")
+                     "and timestamp-aligned exposure/attitude PNG graphs.")
     )
     parser.add_argument("input", type=Path, help="ExifTool plain-text output (.txt)")
     parser.add_argument("-o", "--output", type=Path,
                         help="GPX output path (default: input name with .gpx)")
     parser.add_argument("--plot-output", type=Path,
-                        help="PNG output path (default: INPUT_exposure.png)")
-    parser.add_argument("--no-plot", action="store_true", help="Generate only the GPX")
+                        help="Exposure graph PNG (default: INPUT_exposure.png)")
+    parser.add_argument("--attitude-output", type=Path,
+                        help="Drone attitude PNG (default: INPUT_attitude.png)")
+    parser.add_argument("--no-plot", action="store_true",
+                        help="Generate only the GPX, without either graph")
+    parser.add_argument("--no-exposure", action="store_true",
+                        help="Skip the exposure graph but still generate attitude graph")
+    parser.add_argument("--no-attitude", action="store_true",
+                        help="Skip the attitude graph but still generate exposure graph")
+    parser.add_argument("--unwrap-yaw", action="store_true",
+                        help="Plot continuous yaw across +/-180 degrees instead of raw yaw")
     parser.add_argument("--overwrite", action="store_true",
-                        help="Permit replacing existing GPX and PNG outputs")
+                        help="Permit replacing existing output files")
     args = parser.parse_args()
 
     input_path = args.input
     gpx_path = args.output or input_path.with_suffix(".gpx")
     plot_path = args.plot_output or input_path.with_name(input_path.stem + "_exposure.png")
+    attitude_path = args.attitude_output or input_path.with_name(input_path.stem + "_attitude.png")
+    do_exposure = not (args.no_plot or args.no_exposure)
+    do_attitude = not (args.no_plot or args.no_attitude)
 
     if not input_path.is_file():
         parser.error(f"input file does not exist: {input_path}")
-    paths = [gpx_path] if args.no_plot else [gpx_path, plot_path]
-    if any(path.resolve() == input_path.resolve() for path in paths):
+
+    paths = [gpx_path]
+    if do_exposure:
+        paths.append(plot_path)
+    if do_attitude:
+        paths.append(attitude_path)
+    resolved = [p.resolve() for p in paths]
+    if input_path.resolve() in resolved:
         parser.error("input and output paths must be different")
-    if not args.no_plot and gpx_path.resolve() == plot_path.resolve():
-        parser.error("GPX and PNG output paths must be different")
+    if len(set(resolved)) != len(resolved):
+        parser.error("GPX and PNG output paths must all be different")
     for path in paths:
         if path.exists() and not args.overwrite:
             parser.error(f"output already exists: {path} (use --overwrite to replace it)")
@@ -350,18 +488,23 @@ def main() -> int:
             print(f"[WARNING] ... and {len(problems) - 5} additional invalid samples.",
                   file=sys.stderr)
 
-        # Preserve ExifTool's original sample ordering; do not thin or dedupe.
-        make_gpx(points, input_path.stem).write(
-            gpx_path, encoding="utf-8", xml_declaration=True
-        )
-
-        if not args.no_plot:
+        if do_exposure or do_attitude:
             try:
-                make_exposure_plot(points, input_path.stem, plot_path)
+                import matplotlib  # noqa: F401
             except ImportError:
                 print("[ERROR] Plotting requires matplotlib: "
                       "python3 -m pip install matplotlib", file=sys.stderr)
                 return 1
+
+        # Preserve ExifTool's sample ordering; do not thin or deduplicate.
+        make_gpx(points, input_path.stem).write(
+            gpx_path, encoding="utf-8", xml_declaration=True
+        )
+        if do_exposure:
+            make_exposure_plot(points, input_path.stem, plot_path)
+        if do_attitude:
+            make_attitude_plot(points, input_path.stem, attitude_path,
+                               unwrap_yaw=args.unwrap_yaw)
 
     except (OSError, UnicodeError, ValueError) as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
@@ -369,17 +512,25 @@ def main() -> int:
 
     print(f"Input:         {input_path}")
     print(f"GPX output:    {gpx_path.resolve()}")
-    if not args.no_plot:
-        print(f"Plot output:   {plot_path.resolve()}")
+    if do_exposure:
+        print(f"Exposure PNG:  {plot_path.resolve()}")
+    if do_attitude:
+        print(f"Attitude PNG:  {attitude_path.resolve()}")
     print(f"Samples read:  {total}")
     print(f"GPX points:    {len(points)}")
     print(f"Skipped:       {total - len(points)}")
     print(f"First UTC:     {points[0].timestamp}")
     print(f"Last UTC:      {points[-1].timestamp}")
-    if not args.no_plot:
-        for label, attr in (("ISO", "iso"), ("Shutter", "shutter_seconds"), ("F-number", "f_number")):
-            available = sum(getattr(point, attr) is not None for point in points)
-            print(f"{label + ' points:':<15}{available} / {len(points)}")
+    metrics = []
+    if do_exposure:
+        metrics.extend((("ISO", "iso"), ("Shutter", "shutter_seconds"),
+                        ("F-number", "f_number")))
+    if do_attitude:
+        metrics.extend((("Roll", "roll_deg"), ("Pitch", "pitch_deg"),
+                        ("Yaw", "yaw_deg")))
+    for label, attr in metrics:
+        available = sum(getattr(point, attr) is not None for point in points)
+        print(f"{label + ' points:':<15}{available} / {len(points)}")
     return 0
 
 
