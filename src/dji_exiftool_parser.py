@@ -4,14 +4,14 @@
 Usage:
     python3 dji_exiftool_to_gpx.py DJI_video.txt
     python3 dji_exiftool_to_gpx.py DJI_video.txt -o flight.gpx --plot-output exposure.png
-    python3 dji_exiftool_to_gpx.py DJI_video.txt --attitude-output attitude.png
+    python3 dji_exiftool_to_gpx.py DJI_video.txt --flight_telemetry-output flight_telemetry.png
     python3 dji_exiftool_to_gpx.py DJI_video.txt --unwrap-yaw
     python3 dji_exiftool_to_gpx.py DJI_video.txt --no-plot
 
 Input is *only* the text file produced by 'exiftool -ee VIDEO.MP4'.
 The script never reads the MP4 file or invokes ExifTool.
 
-Requires matplotlib for the exposure and attitude graphs:
+Requires matplotlib for the exposure and flight_telemetry graphs:
     python3 -m pip install matplotlib
 """
 
@@ -28,9 +28,11 @@ import xml.etree.ElementTree as ET
 GPX_NS = "http://www.topografix.com/GPX/1/1"
 XSI_NS = "http://www.w3.org/2001/XMLSchema-instance"
 SCHEMA_URL = "http://www.topografix.com/GPX/1/1/gpx.xsd"
+DJI_EXT_NS = "urn:dji-exiftool:gpx-extensions:1"  # Custom GPX metadata extensions
 
 ET.register_namespace("", GPX_NS)
 ET.register_namespace("xsi", XSI_NS)
+ET.register_namespace("dji", DJI_EXT_NS)
 
 # Example: 32 deg 36' 23.66" N
 DMS_RE = re.compile(
@@ -62,6 +64,40 @@ class TrackPoint:
     pitch_deg: float | None = None
     yaw_deg: float | None = None
     gimbal_yaw_deg: float | None = None
+
+
+@dataclass(frozen=True)
+class VideoMetadata:
+    """Video-level ExifTool fields, not repeated per GPS sample."""
+    resolution: tuple[int, int] | None = None
+    model: str | None = None
+    serial_number: str | None = None
+
+
+def video_subtitle(
+    metadata: VideoMetadata,
+    first_timestamp: datetime,
+    sample_count: int,
+    *,
+    include_resolution: bool = False,
+) -> str:
+    """Shared, consistently formatted subtitles for both figures."""
+    model = metadata.model or "Unavailable"
+    serial = metadata.serial_number or "Unavailable"
+    identity_line = f"Model: {model}  |  Serial Number: {serial}"
+
+    details = []
+    if include_resolution:
+        resolution = metadata.resolution
+        details.append(
+            f"Resolution: {resolution[0]} × {resolution[1]}"
+            if resolution else "Resolution unavailable"
+        )
+    details.extend((
+        f"{first_timestamp:%Y-%m-%d} UTC",
+        f"{sample_count:,} timestamped samples",
+    ))
+    return identity_line + "\n" + "  |  ".join(details)
 
 
 def parse_coordinate(raw: str, *, latitude: bool) -> float:
@@ -149,7 +185,6 @@ def parse_shutter_seconds(raw: str | None) -> float | None:
     """Parse ExifTool shutter speeds such as '1/100', '1/131', or '0.01'."""
     if raw is None:
         return None
-
     # Fractions avoid any dependence on locale and support numeric strings too.
     raw = re.sub(r"\s*(?:s|sec|seconds)$", "", raw.strip(), flags=re.I)
     try:
@@ -192,7 +227,7 @@ def parse_sample(sample: dict[str, str]) -> TrackPoint:
     )
 
 
-def read_samples(path: Path) -> tuple[list[TrackPoint], int, list[str]]:
+def read_samples(path: Path) -> tuple[list[TrackPoint], int, list[str], VideoMetadata]:
     """Group repeated DJI telemetry records by Sample Time, in file order.
 
     Each Sample Time starts a new record. Its displayed value may be rounded,
@@ -203,6 +238,8 @@ def read_samples(path: Path) -> tuple[list[TrackPoint], int, list[str]]:
     problems: list[str] = []
     current: dict[str, str] | None = None
     start_line = 0
+    dimensions: dict[str, int] = {}
+    identity: dict[str, str] = {}
 
     def finish_sample() -> None:
         nonlocal total_samples
@@ -221,6 +258,17 @@ def read_samples(path: Path) -> tuple[list[TrackPoint], int, list[str]]:
                 continue
             key, value = key.strip(), value.strip()
 
+            # Frame Width/Height are video-level metadata, before the samples.
+            # Capture the first valid occurrence of each, not from GPS readings.
+            if key in ("Frame Width", "Frame Height") and key not in dimensions:
+                if re.fullmatch(r"\d+", value) and int(value) > 0:
+                    dimensions[key] = int(value)
+
+            # These DJI tags are encountered within the first Sample Time block
+            # in this file, so read them whether or not a sample is active.
+            if key in ("Model", "Serial Number") and key not in identity and value:
+                identity[key] = value
+
             if key == "Sample Time":
                 finish_sample()
                 current = {}
@@ -233,10 +281,21 @@ def read_samples(path: Path) -> tuple[list[TrackPoint], int, list[str]]:
                 current[key] = value
 
     finish_sample()
-    return points, total_samples, problems
+    width = dimensions.get("Frame Width")
+    height = dimensions.get("Frame Height")
+    resolution = (width, height) if width is not None and height is not None else None
+    metadata = VideoMetadata(
+        resolution=resolution,
+        model=identity.get("Model"),
+        serial_number=identity.get("Serial Number"),
+    )
+    return points, total_samples, problems, metadata
 
 
-def make_gpx(points: list[TrackPoint], track_name: str) -> ET.ElementTree:
+def make_gpx(
+    points: list[TrackPoint], track_name: str, video_metadata: VideoMetadata
+) -> ET.ElementTree:
+    """Build GPX 1.1 with device identity in metadata description and extensions."""
     root = ET.Element(
         f"{{{GPX_NS}}}gpx",
         {
@@ -246,8 +305,24 @@ def make_gpx(points: list[TrackPoint], track_name: str) -> ET.ElementTree:
         },
     )
 
-    metadata = ET.SubElement(root, f"{{{GPX_NS}}}metadata")
-    ET.SubElement(metadata, f"{{{GPX_NS}}}name").text = track_name
+    gpx_metadata = ET.SubElement(root, f"{{{GPX_NS}}}metadata")
+    ET.SubElement(gpx_metadata, f"{{{GPX_NS}}}name").text = track_name
+
+    # Human-readable description for generic GPX viewers.
+    details = []
+    if video_metadata.model:
+        details.append(f"Model: {video_metadata.model}")
+    if video_metadata.serial_number:
+        details.append(f"Serial Number: {video_metadata.serial_number}")
+    if details:
+        ET.SubElement(gpx_metadata, f"{{{GPX_NS}}}desc").text = " | ".join(details)
+
+        # Structured device fields for software that understands GPX extensions.
+        extensions = ET.SubElement(gpx_metadata, f"{{{GPX_NS}}}extensions")
+        if video_metadata.model:
+            ET.SubElement(extensions, f"{{{DJI_EXT_NS}}}Model").text = video_metadata.model
+        if video_metadata.serial_number:
+            ET.SubElement(extensions, f"{{{DJI_EXT_NS}}}SerialNumber").text = video_metadata.serial_number
 
     track = ET.SubElement(root, f"{{{GPX_NS}}}trk")
     ET.SubElement(track, f"{{{GPX_NS}}}name").text = track_name
@@ -267,7 +342,10 @@ def make_gpx(points: list[TrackPoint], track_name: str) -> ET.ElementTree:
     return ET.ElementTree(root)
 
 
-def make_exposure_plot(points: list[TrackPoint], track_name: str, output: Path) -> None:
+def make_exposure_plot(
+    points: list[TrackPoint], track_name: str, output: Path,
+    metadata: VideoMetadata,
+) -> None:
     """Plot ISO, shutter time, f-number, and color temperature as discrete samples.
 
     Each series is aligned to all GPS timestamps. Missing readings stay as NaN;
@@ -313,8 +391,8 @@ def make_exposure_plot(points: list[TrackPoint], track_name: str, output: Path) 
     )
     fig.suptitle(
         f"DJI exposure triangle + color temperature — {track_name}\n"
-        f"{times[0]:%Y-%m-%d} UTC  |  {len(points):,} timestamped samples",
-        fontsize=15,
+        + video_subtitle(metadata, times[0], len(points), include_resolution=True),
+        fontsize=14,
     )
 
     for ax, (field, ylabel, title, color) in zip(axes, series):
@@ -322,19 +400,9 @@ def make_exposure_plot(points: list[TrackPoint], track_name: str, output: Path) 
             getattr(point, field) if getattr(point, field) is not None else math.nan
             for point in points
         ]
-
         # Draw one dot per observed sample. No connecting lines or interpolation.
-        ax.scatter(
-            times,
-            values,
-            marker="o",
-            s=2.5,
-            color=color,
-            alpha=0.9,
-            linewidths=0,
-            rasterized=True,
-        )
-
+        ax.scatter(times, values, marker="o", s=2.5, color=color,
+                   alpha=0.9, linewidths=0, rasterized=True)
         ax.set_ylabel(ylabel)
         ax.set_title(title, loc="left", fontsize=11)
         ax.grid(True, alpha=0.3)
@@ -344,26 +412,17 @@ def make_exposure_plot(points: list[TrackPoint], track_name: str, output: Path) 
     axes[1].yaxis.set_major_formatter(
         FuncFormatter(lambda seconds, _: f"{seconds:.4f}".rstrip("0").rstrip("."))
     )
-
     # F-number as a raw numeric value (e.g., 1.7, not f/1.7).
-    axes[2].yaxis.set_major_formatter(
-        FuncFormatter(lambda value, _: f"{value:g}")
-    )
-
+    axes[2].yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:g}"))
     # Color temperature in Kelvin with conventional integer ticks.
-    axes[3].yaxis.set_major_formatter(
-        FuncFormatter(lambda value, _: f"{value:.0f}")
-    )
-
+    axes[3].yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:.0f}"))
     # Do not let an empty/near-empty axis silently display ±0 Kelvin.
     if min(temperatures) == max(temperatures):
         axes[3].set_ylim(min(temperatures) - 1, max(temperatures) + 1)
 
     axes[-1].set_xlabel("GPS Date/Time (UTC, HH:MM:SS)")
     axes[-1].xaxis.set_major_locator(mdates.AutoDateLocator(tz=timezone.utc))
-    axes[-1].xaxis.set_major_formatter(
-        mdates.DateFormatter("%H:%M:%S", tz=timezone.utc)
-    )
+    axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S", tz=timezone.utc))
 
     fig.savefig(output, dpi=160, facecolor="white")
     plt.close(fig)
@@ -378,34 +437,27 @@ def unwrap_yaw_degrees(values: list[float]) -> list[float]:
     output: list[float] = []
     previous_raw: float | None = None
     previous_continuous: float | None = None
-
     for value in values:
         if not math.isfinite(value):
             output.append(math.nan)
             continue
-
         if previous_raw is None or previous_continuous is None:
             continuous = value
         else:
             # Find the shortest signed angular difference modulo 360 degrees.
             delta = (value - previous_raw + 180.0) % 360.0 - 180.0
             continuous = previous_continuous + delta
-
         output.append(continuous)
         previous_raw = value
         previous_continuous = continuous
-
     return output
 
 
-def make_attitude_plot(
-    points: list[TrackPoint],
-    track_name: str,
-    output: Path,
-    *,
-    unwrap_yaw: bool = False
+def make_flight_telemetry_plot(
+    points: list[TrackPoint], track_name: str, output: Path,
+    metadata: VideoMetadata, *, unwrap_yaw: bool = False
 ) -> None:
-    """Draw DJI drone roll/pitch/yaw and gimbal yaw, sharing GPS time on x-axis.
+    """Draw drone and gimbal angles, plus absolute altitude, versus GPS time.
 
     Every series has one slot per GPS trackpoint. Missing angles create gaps;
     no samples are invented. Raw drone and gimbal yaw are split at +/-180-degree
@@ -425,66 +477,56 @@ def make_attitude_plot(
         p.gimbal_yaw_deg if p.gimbal_yaw_deg is not None else math.nan
         for p in points
     ]
-
     yaw = unwrap_yaw_degrees(yaw_raw) if unwrap_yaw else yaw_raw
     gimbal_yaw = unwrap_yaw_degrees(gimbal_yaw_raw) if unwrap_yaw else gimbal_yaw_raw
+    altitudes = [p.altitude_m if p.altitude_m is not None else math.nan for p in points]
+    has_altitude = any(math.isfinite(v) for v in altitudes)
+    if not has_altitude:
+        print("[WARNING] No Absolute Altitude readings found; "
+              "altitude panel will show no data.", file=sys.stderr)
 
-    fig, axes = plt.subplots(
-        4, 1, figsize=(14, 11), sharex=True, constrained_layout=True
-    )
+    fig, axes = plt.subplots(5, 1, figsize=(14, 14), sharex=True, constrained_layout=True)
     fig.suptitle(
-        f"DJI drone and gimbal attitude — {track_name}\n"
-        f"{times[0]:%Y-%m-%d} UTC  |  {len(points):,} GPS-timestamped samples",
-        fontsize=15,
+        f"DJI flight telemetry — {track_name}\n"
+        + video_subtitle(metadata, times[0], len(points)),
+        fontsize=14,
     )
 
     for ax, values, label, color, is_yaw in zip(
         axes,
-        (roll, pitch, yaw, gimbal_yaw),
-        ("Drone roll (°)", "Drone pitch (°)", "Drone yaw (°)", "Gimbal yaw (°)"),
-        ("tab:blue", "tab:orange", "tab:green", "tab:purple"),
-        (False, False, True, True),
+        (roll, pitch, yaw, gimbal_yaw, altitudes),
+        ("Drone roll (°)", "Drone pitch (°)", "Drone yaw (°)",
+         "Gimbal yaw (°)", "Absolute altitude (m)"),
+        ("tab:blue", "tab:orange", "tab:green", "tab:purple", "tab:red"),
+        (False, False, True, True, False),
     ):
         ax.set_ylabel(label)
         ax.set_title(label, loc="left", fontsize=11)
-        ax.axhline(0, linewidth=0.75, color="gray", alpha=0.6)
+        if label == "Absolute altitude (m)" and not has_altitude:
+            ax.text(0.5, 0.5, "No Absolute Altitude data available",
+                    transform=ax.transAxes, ha="center", va="center")
+        if label != "Absolute altitude (m)":
+            ax.axhline(0, linewidth=0.75, color="gray", alpha=0.6)
         ax.grid(True, alpha=0.3)
         ax.margins(x=0.01)
-
         if not is_yaw or unwrap_yaw:
-            ax.plot(
-                times,
-                values,
-                color=color,
-                linewidth=0.9,
-                marker=".",
-                markersize=1.8,
-            )
+            ax.plot(times, values, color=color, linewidth=0.9,
+                    marker=".", markersize=1.8)
         else:
             # Plot every raw reading, but omit a connecting segment when the
             # value jumps across the +/-180 degree boundary (or is missing).
-            ax.plot(
-                times,
-                values,
-                linestyle="None",
-                color=color,
-                marker=".",
-                markersize=1.8,
-            )
-
+            ax.plot(times, values, linestyle="None", color=color,
+                    marker=".", markersize=1.8)
             xs: list[datetime] = []
             ys: list[float] = []
-
             for timestamp, angle in zip(times, values):
                 if not math.isfinite(angle) or (ys and abs(angle - ys[-1]) > 180):
                     if xs:
                         ax.plot(xs, ys, color=color, linewidth=0.9)
                     xs, ys = [], []
-
                 if math.isfinite(angle):
                     xs.append(timestamp)
                     ys.append(angle)
-
             if xs:
                 ax.plot(xs, ys, color=color, linewidth=0.9)
 
@@ -495,11 +537,9 @@ def make_attitude_plot(
         axes[2].set_title("Drone yaw (native DJI, ±180° wrap)", loc="left", fontsize=11)
         axes[3].set_title("Gimbal yaw (native DJI, ±180° wrap)", loc="left", fontsize=11)
 
-    axes[3].set_xlabel("GPS Date/Time (UTC, HH:MM:SS)")
-    axes[3].xaxis.set_major_locator(mdates.AutoDateLocator(tz=timezone.utc))
-    axes[3].xaxis.set_major_formatter(
-        mdates.DateFormatter("%H:%M:%S", tz=timezone.utc)
-    )
+    axes[-1].set_xlabel("GPS Date/Time (UTC, HH:MM:SS)")
+    axes[-1].xaxis.set_major_locator(mdates.AutoDateLocator(tz=timezone.utc))
+    axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S", tz=timezone.utc))
 
     fig.savefig(output, dpi=160, facecolor="white")
     plt.close(fig)
@@ -507,201 +547,121 @@ def make_attitude_plot(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description=(
-            "Convert 'exiftool -ee VIDEO.MP4' text output into a GPX track "
-            "and timestamp-aligned exposure/attitude PNG graphs."
-        )
+        description=("Convert 'exiftool -ee VIDEO.MP4' text output into a GPX track "
+                     "and timestamp-aligned exposure/flight telemetry PNG graphs.")
     )
-
-    parser.add_argument(
-        "input",
-        type=Path,
-        help="ExifTool plain-text output (.txt)",
-    )
-
-    parser.add_argument(
-        "-o", "--output",
-        type=Path,
-        help="GPX output path (default: input name with .gpx)",
-    )
-
-    parser.add_argument(
-        "--plot-output",
-        type=Path,
-        help="Exposure graph PNG (default: INPUT_exposure.png)",
-    )
-
-    parser.add_argument(
-        "--attitude-output",
-        type=Path,
-        help="Drone + gimbal attitude PNG (default: INPUT_attitude.png)",
-    )
-
-    parser.add_argument(
-        "--no-plot",
-        action="store_true",
-        help="Generate only the GPX, without either graph",
-    )
-
-    parser.add_argument(
-        "--no-exposure",
-        action="store_true",
-        help="Skip the exposure graph but still generate attitude graph",
-    )
-
-    parser.add_argument(
-        "--no-attitude",
-        action="store_true",
-        help="Skip the attitude graph but still generate exposure graph",
-    )
-
-    parser.add_argument(
-        "--unwrap-yaw",
-        action="store_true",
-        help="Plot continuous drone and gimbal yaw across +/-180 degrees",
-    )
-
-    parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="Permit replacing existing output files",
-    )
-
+    parser.add_argument("input", type=Path, help="ExifTool plain-text output (.txt)")
+    parser.add_argument("-o", "--output", type=Path,
+                        help="GPX output path (default: input name with .gpx)")
+    parser.add_argument("--plot-output", type=Path,
+                        help="Exposure graph PNG (default: INPUT_exposure.png)")
+    parser.add_argument("--flight_telemetry-output", "--flight-telemetry-output", "--telemetry-output", "--attitude-output",
+                        type=Path, dest="flight_telemetry_output",
+                        help="Drone/gimbal angles + altitude PNG (default: INPUT_telemetry.png)")
+    parser.add_argument("--no-plot", action="store_true",
+                        help="Generate only the GPX, without either graph")
+    parser.add_argument("--no-exposure", action="store_true",
+                        help="Skip exposure PNG but still generate flight telemetry PNG")
+    parser.add_argument("--no-flight_telemetry", "--no-telemetry", "--no-attitude",
+                        dest="no_flight_telemetry", action="store_true",
+                        help="Skip flight telemetry PNG but still generate exposure PNG")
+    parser.add_argument("--unwrap-yaw", action="store_true",
+                        help="Plot continuous drone and gimbal yaw across +/-180 degrees")
+    parser.add_argument("--overwrite", action="store_true",
+                        help="Permit replacing existing output files")
     args = parser.parse_args()
 
     input_path = args.input
     gpx_path = args.output or input_path.with_suffix(".gpx")
-    plot_path = args.plot_output or input_path.with_name(
-        input_path.stem + "_exposure.png"
-    )
-    attitude_path = args.attitude_output or input_path.with_name(
-        input_path.stem + "_attitude.png"
-    )
-
+    plot_path = args.plot_output or input_path.with_name(input_path.stem + "_exposure.png")
+    flight_telemetry_path = args.flight_telemetry_output or input_path.with_name(input_path.stem + "_telemetry.png")
     do_exposure = not (args.no_plot or args.no_exposure)
-    do_attitude = not (args.no_plot or args.no_attitude)
+    do_flight_telemetry = not (args.no_plot or args.no_flight_telemetry)
 
     if not input_path.is_file():
         parser.error(f"input file does not exist: {input_path}")
 
     paths = [gpx_path]
-
     if do_exposure:
         paths.append(plot_path)
-
-    if do_attitude:
-        paths.append(attitude_path)
-
+    if do_flight_telemetry:
+        paths.append(flight_telemetry_path)
     resolved = [p.resolve() for p in paths]
-
     if input_path.resolve() in resolved:
         parser.error("input and output paths must be different")
-
     if len(set(resolved)) != len(resolved):
         parser.error("GPX and PNG output paths must all be different")
-
     for path in paths:
         if path.exists() and not args.overwrite:
-            parser.error(
-                f"output already exists: {path} (use --overwrite to replace it)"
-            )
+            parser.error(f"output already exists: {path} (use --overwrite to replace it)")
         if not path.parent.is_dir():
             parser.error(f"output directory does not exist: {path.parent}")
 
     try:
-        points, total, problems = read_samples(input_path)
-
+        points, total, problems, metadata = read_samples(input_path)
         if not points:
-            print(
-                "[ERROR] No valid GPS samples found in input file.",
-                file=sys.stderr,
-            )
+            print("[ERROR] No valid GPS samples found in input file.", file=sys.stderr)
             for problem in problems[:5]:
                 print(f"[WARNING] {problem}", file=sys.stderr)
             return 1
 
         for problem in problems[:5]:
             print(f"[WARNING] Skipped {problem}", file=sys.stderr)
-
         if len(problems) > 5:
-            print(
-                f"[WARNING] ... and {len(problems) - 5} additional invalid samples.",
-                file=sys.stderr,
-            )
+            print(f"[WARNING] ... and {len(problems) - 5} additional invalid samples.",
+                  file=sys.stderr)
 
-        if do_exposure or do_attitude:
+        if do_exposure or do_flight_telemetry:
             try:
                 import matplotlib  # noqa: F401
             except ImportError:
-                print(
-                    "[ERROR] Plotting requires matplotlib: "
-                    "python3 -m pip install matplotlib",
-                    file=sys.stderr,
-                )
+                print("[ERROR] Plotting requires matplotlib: "
+                      "python3 -m pip install matplotlib", file=sys.stderr)
                 return 1
 
         # Preserve ExifTool's sample ordering; do not thin or deduplicate.
-        make_gpx(points, input_path.stem).write(
-            gpx_path,
-            encoding="utf-8",
-            xml_declaration=True,
+        make_gpx(points, input_path.stem, metadata).write(
+            gpx_path, encoding="utf-8", xml_declaration=True
         )
-
         if do_exposure:
-            make_exposure_plot(points, input_path.stem, plot_path)
-
-        if do_attitude:
-            make_attitude_plot(
-                points,
-                input_path.stem,
-                attitude_path,
-                unwrap_yaw=args.unwrap_yaw,
-            )
+            make_exposure_plot(points, input_path.stem, plot_path, metadata)
+        if do_flight_telemetry:
+            make_flight_telemetry_plot(points, input_path.stem, flight_telemetry_path,
+                               metadata, unwrap_yaw=args.unwrap_yaw)
 
     except (OSError, UnicodeError, ValueError) as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
         return 1
 
     print(f"Input:         {input_path}")
+    if metadata.resolution is not None:
+        print(f"Resolution:    {metadata.resolution[0]}x{metadata.resolution[1]}")
+    else:
+        print("Resolution:    unavailable (Frame Width/Frame Height missing)")
+    print(f"Model:         {metadata.model or 'Unavailable'}")
+    print(f"Serial number: {metadata.serial_number or 'Unavailable'}")
     print(f"GPX output:    {gpx_path.resolve()}")
-
     if do_exposure:
         print(f"Exposure PNG:  {plot_path.resolve()}")
-
-    if do_attitude:
-        print(f"Attitude PNG:  {attitude_path.resolve()}")
-
+    if do_flight_telemetry:
+        print(f"Telemetry PNG:  {flight_telemetry_path.resolve()}")
     print(f"Samples read:  {total}")
     print(f"GPX points:    {len(points)}")
     print(f"Skipped:       {total - len(points)}")
     print(f"First UTC:     {points[0].timestamp}")
     print(f"Last UTC:      {points[-1].timestamp}")
-
     metrics = []
-
     if do_exposure:
-        metrics.extend((
-            ("ISO", "iso"),
-            ("Shutter", "shutter_seconds"),
-            ("F-number", "f_number"),
-            ("Color temperature", "color_temperature_k"),
-        ))
-
-    if do_attitude:
-        metrics.extend((
-            ("Roll", "roll_deg"),
-            ("Pitch", "pitch_deg"),
-            ("Yaw", "yaw_deg"),
-            ("Gimbal yaw", "gimbal_yaw_deg"),
-        ))
-
+        metrics.extend((("ISO", "iso"), ("Shutter", "shutter_seconds"),
+                        ("F-number", "f_number"),
+                        ("Color temperature", "color_temperature_k")))
+    if do_flight_telemetry:
+        metrics.extend((("Roll", "roll_deg"), ("Pitch", "pitch_deg"),
+                        ("Yaw", "yaw_deg"), ("Gimbal yaw", "gimbal_yaw_deg"),
+                        ("Altitude", "altitude_m")))
     for label, attr in metrics:
-        available = sum(
-            getattr(point, attr) is not None
-            for point in points
-        )
+        available = sum(getattr(point, attr) is not None for point in points)
         print(f"{label + ' points:':<15}{available} / {len(points)}")
-
     return 0
 
 
